@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: green-curtailment-backend
+    env: docker
+    plan: free
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+
+  - type: web
+    name: green-curtailment-frontend
+    env: docker
+    plan: free
+    dockerContext: ./frontend
+    dockerfilePath: ./frontend/Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: VITE_API_BASE
+        value: https://green-curtailment-backend.onrender.com
+      - key: VITE_WS_BASE
+        value: wss://green-curtailment-backend.onrender.com
