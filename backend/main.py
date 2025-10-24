@@ -18,8 +18,11 @@ app.add_middleware(
 
 # --- Hugging Face config ---
 HF_TOKEN = os.getenv("HF_TOKEN")  # set in Render → Environment
-HF_MODEL = os.getenv("HF_MODEL", "google/gemma-2b-it").strip()
-HF_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+HF_MODEL = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.2").strip()
+
+# Endpoints
+HF_URL_CHAT = "https://api-inference.huggingface.co/v1/chat/completions"   # OpenAI-compatible
+HF_URL_MODELS = f"https://api-inference.huggingface.co/models/{HF_MODEL}"  # legacy
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "60"))
 
@@ -32,28 +35,49 @@ SYSTEM_PROMPT = (
 )
 
 def ask_hf(user_msg: str, max_new_tokens: int = 200) -> str:
-    """Call Hugging Face Inference API and return plain text."""
+    """Try HF Chat Completions first; fallback to legacy /models endpoint."""
     if not HF_TOKEN:
         return "⚠️ HF_TOKEN is not set. Add it in Render → Environment."
 
-    payload = {
-        "inputs": f"{SYSTEM_PROMPT}\n\nUser: {user_msg}\nAssistant:",
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "return_full_text": False
-        }
+    # 1) Chat Completions API
+    chat_payload = {
+        "model": HF_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "max_tokens": max_new_tokens,
+        "temperature": 0.3,
+        "stream": False,
     }
-
     try:
-        resp = requests.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=HF_TIMEOUT)
+        r = requests.post(HF_URL_CHAT, headers=HF_HEADERS, json=chat_payload, timeout=HF_TIMEOUT)
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, dict) and "choices" in j and j["choices"]:
+                return (j["choices"][0]["message"]["content"] or "").strip()
+        else:
+            # اگر مدل روی chat endpoint در دسترس نبود، به fallback برویم
+            if r.status_code not in (404, 422):
+                return f"❌ HF Chat Error {r.status_code}: {r.text}"
+    except Exception:
+        # اگر شبکه مشکل داشت، به fallback می‌رویم
+        pass
+
+    # 2) Fallback: legacy models endpoint
+    legacy_payload = {
+        "inputs": f"{SYSTEM_PROMPT}\n\nUser: {user_msg}\nAssistant:",
+        "parameters": {"max_new_tokens": max_new_tokens, "return_full_text": False},
+    }
+    try:
+        r2 = requests.post(HF_URL_MODELS, headers=HF_HEADERS, json=legacy_payload, timeout=HF_TIMEOUT)
     except Exception as e:
         return f"❌ Connection error to Hugging Face: {e}"
 
-    if resp.status_code != 200:
-        return f"❌ HF Error {resp.status_code} at {HF_URL}: {resp.text}"
+    if r2.status_code != 200:
+        return f"❌ HF Error {r2.status_code} at {HF_URL_MODELS}: {r2.text}"
 
-
-    data = resp.json()
+    data = r2.json()
     if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
         return (data[0]["generated_text"] or "").strip()
 
