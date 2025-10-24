@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+from statistics import mean
 import random
 import os, requests
 
@@ -32,7 +33,10 @@ HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "60"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OR_MODEL = os.getenv("OR_MODEL", "meta-llama/llama-3.1-8b-instruct").strip()
-OR_HEADERS = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"} if OPENROUTER_API_KEY else {}
+OR_HEADERS = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Content-Type": "application/json",
+} if OPENROUTER_API_KEY else {}
 
 SYSTEM_PROMPT = (
     "You are an assistant that helps minimize renewable energy curtailment. "
@@ -41,6 +45,15 @@ SYSTEM_PROMPT = (
     "time-of-use strategies, ancillary markets, storage sizing, and bidding tactics. "
     "Limit answers to 4–6 sentences unless explicitly asked for more detail."
 )
+
+# =======================
+#  Bid parameters (tunable via env)
+# =======================
+BID_LOOKAHEAD = int(os.getenv("BID_LOOKAHEAD", "6"))            # hours to look ahead
+SAFETY_MAX     = float(os.getenv("BID_SAFETY_MAX", "0.9"))      # when risk=0
+SAFETY_MIN     = float(os.getenv("BID_SAFETY_MIN", "0.6"))      # when risk=1
+PREMIUM_BASE   = float(os.getenv("BID_PREMIUM_BASE", "5.0"))    # €/MWh base
+PREMIUM_MAX    = float(os.getenv("BID_PREMIUM_MAX", "25.0"))    # €/MWh added at risk=1
 
 # =======================
 #  Provider Callers
@@ -153,7 +166,14 @@ def health():
         "huggingface": bool(HF_TOKEN),
         "openrouter": bool(OPENROUTER_API_KEY),
     }
-    return {"ok": True, "model": HF_MODEL, "providers": providers}
+    bid_params = {
+        "lookahead_h": BID_LOOKAHEAD,
+        "safety_max": SAFETY_MAX,
+        "safety_min": SAFETY_MIN,
+        "premium_base_eur_mwh": PREMIUM_BASE,
+        "premium_max_eur_mwh": PREMIUM_MAX,
+    }
+    return {"ok": True, "model": HF_MODEL, "providers": providers, "bid_params": bid_params}
 
 @app.get("/forecast")
 def forecast(site_id: str = "site-A", horizon_hours: int = 24):
@@ -175,12 +195,59 @@ def forecast(site_id: str = "site-A", horizon_hours: int = 24):
         })
     return {"site_id": site_id, "points": points}
 
+# ---------- Bid from forecast (not random) ----------
+def compute_bid_from_points(points, look_ahead_hours: int = BID_LOOKAHEAD):
+    """
+    Compute bid (qty, price) from forecast points.
+    Uses next `look_ahead_hours` hours (or less if not available).
+    """
+    window = points[:max(1, min(look_ahead_hours, len(points)))]
+
+    avg_gen = mean(p["gen_mw"] for p in window)                        # MW
+    avg_price = mean(p["price_eur_mwh"] for p in window)               # €/MWh
+    avg_risk = mean(p["curtailment_prob"] for p in window)             # 0..1
+
+    # expected available power considering curtailment
+    expected_available = mean(p["gen_mw"] * (1 - p["curtailment_prob"]) for p in window)
+
+    # Safety factor: linearly interpolate between SAFETY_MAX (risk=0) and SAFETY_MIN (risk=1)
+    safety = SAFETY_MAX - (SAFETY_MAX - SAFETY_MIN) * avg_risk
+    qty_mw = max(0.0, round(expected_available * safety, 2))
+
+    # Risk premium for price (linear)
+    premium = PREMIUM_BASE + (PREMIUM_MAX * avg_risk)
+    price_eur_mwh = max(0.0, round(avg_price + premium, 2))
+
+    diagnostics = {
+        "look_ahead_hours": len(window),
+        "avg_gen_mw": round(avg_gen, 2),
+        "avg_price_eur_mwh": round(avg_price, 2),
+        "avg_curtailment_prob": round(avg_risk, 3),
+        "expected_available_mw": round(expected_available, 2),
+        "safety_factor": round(safety, 3),
+        "risk_premium_eur_mwh": round(premium, 2),
+    }
+    return qty_mw, price_eur_mwh, diagnostics
+
 @app.post("/bid")
 def bid(req: BidRequest):
-    """Dummy bid output (replace with your real ML model)."""
-    qty = round(30 + 10 * random.random(), 2)        # MW
-    price = round(60 + 15 * random.random(), 2)      # €/MWh
-    return {"site_id": req.site_id, "qty_mw": qty, "price_eur_mwh": price}
+    """
+    Market bid based on forecast (not random).
+    - Quantity (MW): expected available power with safety margin vs curtailment.
+    - Price (€/MWh): avg market price + risk premium.
+    """
+    # بگیر همان داده‌های نمودار را (از تابع forecast همین سرویس)
+    fc = forecast(site_id=req.site_id, horizon_hours=req.horizon_hours)
+    points = fc["points"]
+
+    qty, price, diag = compute_bid_from_points(points, look_ahead_hours=BID_LOOKAHEAD)
+
+    return {
+        "site_id": req.site_id,
+        "qty_mw": qty,
+        "price_eur_mwh": price,
+        "diagnostics": diag,
+    }
 
 @app.websocket("/ws/chat")
 async def chat_socket(ws: WebSocket):
