@@ -185,7 +185,7 @@ def bid(req: BidRequest):
 @app.websocket("/ws/chat")
 async def chat_socket(ws: WebSocket):
     await ws.accept()
-    welcome = "🤖 Connected. Primary: Hugging Face; Fallback: OpenRouter. (English only)"
+    welcome = "🤖 Hi! I'm your Curtailment Advisor — ready to help you minimize energy curtailment and optimize your renewable output."
     if not HF_TOKEN and not OPENROUTER_API_KEY:
         welcome += " ⚠️ No HF_TOKEN or OPENROUTER_API_KEY is set in Environment."
     await ws.send_text(welcome)
