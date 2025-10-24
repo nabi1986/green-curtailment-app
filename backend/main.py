@@ -18,7 +18,7 @@ app.add_middleware(
 
 # --- Hugging Face config ---
 HF_TOKEN = os.getenv("HF_TOKEN")  # set in Render → Environment
-HF_MODEL = os.getenv("HF_MODEL", "google/gemma-2b-it")
+HF_MODEL = os.getenv("HF_MODEL", "google/gemma-2b-it").strip()
 HF_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "60"))
@@ -50,7 +50,8 @@ def ask_hf(user_msg: str, max_new_tokens: int = 200) -> str:
         return f"❌ Connection error to Hugging Face: {e}"
 
     if resp.status_code != 200:
-        return f"❌ HF Error {resp.status_code}: {resp.text}"
+        return f"❌ HF Error {resp.status_code} at {HF_URL}: {resp.text}"
+
 
     data = resp.json()
     if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
