@@ -180,7 +180,7 @@ def forecast(site_id: str = "site-A", horizon_hours: int = 24):
     """Dummy time series for generation/price/risk."""
     now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
     points = []
-    base_gen = 42.0
+    base_gen = 0
     base_price = 70.0
     for i in range(horizon_hours):
         t = now + timedelta(hours=i)
