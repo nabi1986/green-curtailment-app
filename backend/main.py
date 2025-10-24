@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import random
-import os, requests  # for Hugging Face calls
+import os, requests
 
 app = FastAPI()
 
@@ -16,15 +16,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Hugging Face config ---
+# =======================
+#  Providers & Settings
+# =======================
+
+# --- Hugging Face (primary) ---
 HF_TOKEN = os.getenv("HF_TOKEN")  # set in Render → Environment
 HF_MODEL = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.2").strip()
-
-# Endpoints
 HF_URL_CHAT = "https://api-inference.huggingface.co/v1/chat/completions"   # OpenAI-compatible
 HF_URL_MODELS = f"https://api-inference.huggingface.co/models/{HF_MODEL}"  # legacy
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "60"))
+
+# --- OpenRouter (fallback) ---
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OR_MODEL = os.getenv("OR_MODEL", "meta-llama/llama-3.1-8b-instruct").strip()
+OR_HEADERS = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"} if OPENROUTER_API_KEY else {}
 
 SYSTEM_PROMPT = (
     "You are an assistant that helps minimize renewable energy curtailment. "
@@ -34,68 +42,118 @@ SYSTEM_PROMPT = (
     "Limit answers to 4–6 sentences unless explicitly asked for more detail."
 )
 
-def ask_hf(user_msg: str, max_new_tokens: int = 200) -> str:
-    """Try HF Chat Completions first; fallback to legacy /models endpoint."""
-    if not HF_TOKEN:
-        return "⚠️ HF_TOKEN is not set. Add it in Render → Environment."
+# =======================
+#  Provider Callers
+# =======================
 
-    # 1) Chat Completions API
-    chat_payload = {
-        "model": HF_MODEL,
+def ask_openrouter(user_msg: str, max_new_tokens: int = 220) -> str:
+    """Call OpenRouter (OpenAI-compatible)."""
+    if not OPENROUTER_API_KEY:
+        return "⚠️ OPENROUTER_API_KEY is not set."
+    payload = {
+        "model": OR_MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ],
         "max_tokens": max_new_tokens,
         "temperature": 0.3,
-        "stream": False,
     }
     try:
-        r = requests.post(HF_URL_CHAT, headers=HF_HEADERS, json=chat_payload, timeout=HF_TIMEOUT)
-        if r.status_code == 200:
-            j = r.json()
-            if isinstance(j, dict) and "choices" in j and j["choices"]:
-                return (j["choices"][0]["message"]["content"] or "").strip()
-        else:
-            # اگر مدل روی chat endpoint در دسترس نبود، به fallback برویم
-            if r.status_code not in (404, 422):
-                return f"❌ HF Chat Error {r.status_code}: {r.text}"
-    except Exception:
-        # اگر شبکه مشکل داشت، به fallback می‌رویم
-        pass
-
-    # 2) Fallback: legacy models endpoint
-    legacy_payload = {
-        "inputs": f"{SYSTEM_PROMPT}\n\nUser: {user_msg}\nAssistant:",
-        "parameters": {"max_new_tokens": max_new_tokens, "return_full_text": False},
-    }
-    try:
-        r2 = requests.post(HF_URL_MODELS, headers=HF_HEADERS, json=legacy_payload, timeout=HF_TIMEOUT)
+        r = requests.post(OPENROUTER_URL, headers=OR_HEADERS, json=payload, timeout=HF_TIMEOUT)
     except Exception as e:
-        return f"❌ Connection error to Hugging Face: {e}"
+        return f"❌ OpenRouter connection error: {e}"
+    if r.status_code != 200:
+        return f"❌ OpenRouter Error {r.status_code}: {r.text}"
+    j = r.json()
+    try:
+        return (j["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        return str(j)
 
-    if r2.status_code != 200:
-        return f"❌ HF Error {r2.status_code} at {HF_URL_MODELS}: {r2.text}"
+def ask_hf(user_msg: str, max_new_tokens: int = 200) -> tuple[str, bool]:
+    """
+    Try Hugging Face (Chat, then Legacy).
+    Returns (reply, ok_bool). If ok_bool=False, caller can try fallback.
+    """
+    if HF_TOKEN:
+        # 1) Chat Completions API
+        chat_payload = {
+            "model": HF_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            "max_tokens": max_new_tokens,
+            "temperature": 0.3,
+            "stream": False,
+        }
+        try:
+            r = requests.post(HF_URL_CHAT, headers=HF_HEADERS, json=chat_payload, timeout=HF_TIMEOUT)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, dict) and "choices" in j and j["choices"]:
+                    return (j["choices"][0]["message"]["content"] or "").strip(), True
+            else:
+                # اگر مدل روی chat endpoint در دسترس نبود، روی legacy می‌رویم
+                if r.status_code not in (404, 422):
+                    return f"❌ HF Chat Error {r.status_code}: {r.text}", False
+        except Exception:
+            # اگر شبکه مشکل داشت، به legacy می‌رویم
+            pass
 
-    data = r2.json()
-    if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
-        return (data[0]["generated_text"] or "").strip()
+        # 2) Legacy /models endpoint
+        legacy_payload = {
+            "inputs": f"{SYSTEM_PROMPT}\n\nUser: {user_msg}\nAssistant:",
+            "parameters": {"max_new_tokens": max_new_tokens, "return_full_text": False},
+        }
+        try:
+            r2 = requests.post(HF_URL_MODELS, headers=HF_HEADERS, json=legacy_payload, timeout=HF_TIMEOUT)
+        except Exception as e:
+            return f"❌ Connection error to Hugging Face: {e}", False
 
-    # Fallback if model returns unexpected schema
-    return str(data)
+        if r2.status_code != 200:
+            # اجازه بدهیم fallback تصمیم بگیرد
+            return f"❌ HF Error {r2.status_code} at {HF_URL_MODELS}: {r2.text}", False
 
+        data = r2.json()
+        if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
+            return (data[0]["generated_text"] or "").strip(), True
+        return str(data), True
 
-# ---------- App models & endpoints ----------
+    # اگر HF_TOKEN نداریم، مستقیماً می‌گوییم ok=False که fallback اجرا شود
+    return "⚠️ HF token not set.", False
+
+def ask_ai(user_msg: str, max_new_tokens: int = 200) -> str:
+    """Main router: try HF first; if it fails, use OpenRouter."""
+    hf_reply, hf_ok = ask_hf(user_msg, max_new_tokens=max_new_tokens)
+    if hf_ok:
+        return hf_reply
+
+    # اگر HF جواب نداد/404 شد و OpenRouter داریم، از OpenRouter استفاده کن
+    if OPENROUTER_API_KEY:
+        or_reply = ask_openrouter(user_msg, max_new_tokens=max_new_tokens)
+        return or_reply
+
+    # اگر هیچ‌کدام در دسترس نبود
+    return hf_reply  # خطای HF را برگردانیم که مشخص باشد چه شد
+
+# =======================
+#  API & WebSocket
+# =======================
+
 class BidRequest(BaseModel):
     site_id: str
     horizon_hours: int = 24
     features: dict | None = None  # grid/weather features
 
-
 @app.get("/health")
 def health():
-    return {"ok": True, "model": HF_MODEL}
-
+    providers = {
+        "huggingface": bool(HF_TOKEN),
+        "openrouter": bool(OPENROUTER_API_KEY),
+    }
+    return {"ok": True, "model": HF_MODEL, "providers": providers}
 
 @app.get("/forecast")
 def forecast(site_id: str = "site-A", horizon_hours: int = 24):
@@ -117,7 +175,6 @@ def forecast(site_id: str = "site-A", horizon_hours: int = 24):
         })
     return {"site_id": site_id, "points": points}
 
-
 @app.post("/bid")
 def bid(req: BidRequest):
     """Dummy bid output (replace with your real ML model)."""
@@ -125,22 +182,20 @@ def bid(req: BidRequest):
     price = round(60 + 15 * random.random(), 2)      # €/MWh
     return {"site_id": req.site_id, "qty_mw": qty, "price_eur_mwh": price}
 
-
-# ---------- WebSocket Chat (English-only, via HF) ----------
 @app.websocket("/ws/chat")
 async def chat_socket(ws: WebSocket):
     await ws.accept()
-    welcome = "🤖 Connected to Hugging Face. Ask about curtailment mitigation. (English only)"
-    if not HF_TOKEN:
-        welcome += " ⚠️ HF_TOKEN is not set; add it in Render → Environment."
+    welcome = "🤖 Connected. Primary: Hugging Face; Fallback: OpenRouter. (English only)"
+    if not HF_TOKEN and not OPENROUTER_API_KEY:
+        welcome += " ⚠️ No HF_TOKEN or OPENROUTER_API_KEY is set in Environment."
     await ws.send_text(welcome)
 
     try:
         while True:
             user_msg = await ws.receive_text()
-            reply = ask_hf(user_msg, max_new_tokens=200)
+            reply = ask_ai(user_msg, max_new_tokens=200)
             if not reply or reply.isspace():
-                reply = "No response from the model. Try again or switch to a lighter model."
+                reply = "No response from providers. Check HF/OpenRouter credentials."
             await ws.send_text(reply)
     except WebSocketDisconnect:
         pass
